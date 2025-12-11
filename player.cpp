@@ -221,11 +221,36 @@ Item* Player::getWeapon(slots_t slot, bool ignoreAmmo) const
 	if (!ignoreAmmo && weaponType == WEAPON_DISTANCE) {
 		const ItemType& it = Item::items[item->getID()];
 		if (it.ammoType != AMMO_NONE) {
-			Item* ammoItem = inventory[CONST_SLOT_AMMO];
-			if (!ammoItem || ammoItem->getAmmoType() != it.ammoType) {
+			if (Item* quiver = inventory[CONST_SLOT_RIGHT]) {
+				if (!quiver || quiver->getWeaponType() != WEAPON_QUIVER) {
+					return nullptr;
+				}
+
+				Container* container = quiver->getContainer();
+				if (!container) {
+					return nullptr;
+				}
+
+				bool found = false;
+				for (Item* ammoQuiver : container->getItemList()) {
+					if (ammoQuiver->getAmmoType() == it.ammoType) {
+						item = ammoQuiver;
+						found = true;
+						break;
+					}
+				}
+
+				if (!found) {
+					return nullptr;
+				}
+			} else if (Item* ammoItem = inventory[CONST_SLOT_AMMO]) {
+				if (!ammoItem || ammoItem->getAmmoType() != it.ammoType) {
+					return nullptr;
+				}
+				item = ammoItem;
+			} else {
 				return nullptr;
 			}
-			item = ammoItem;
 		}
 	}
 	return item;
@@ -665,6 +690,7 @@ void Player::addStorageValue(const uint32_t key, const int32_t value, const bool
 				value & 0xFF
 			);
 			return;
+		} else if (IS_IN_KEYRANGE(key, MOUNTS_RANGE)) {
 		} else {
 			std::cout << "Warning: unknown reserved key: " << key << " player: " << getName() << std::endl;
 			return;
@@ -850,6 +876,7 @@ DepotLocker& Player::getDepotLocker()
 {
 	if (!depotLocker) {
 		depotLocker = std::make_shared<DepotLocker>(ITEM_LOCKER);
+		depotLocker->internalAddThing(Item::CreateItem(ITEM_MARKET));
 		depotLocker->internalAddThing(inbox);
 
 		DepotChest* depotChest = new DepotChest(ITEM_DEPOT, false);
@@ -916,6 +943,31 @@ void Player::sendPing()
 			client->logout(true, true);
 		} else {
 			g_game.removeCreature(this, true);
+		}
+	}
+}
+
+void Player::autoOpenContainers()
+{
+	for (int32_t i = CONST_SLOT_FIRST; i <= CONST_SLOT_LAST; i++) {
+		Item* item = inventory[i];
+		if (!item) {
+			continue;
+		}
+
+		if (Container* container = item->getContainer()) {
+			if (container->getAutoOpen() >= 0) {
+				addContainer(container->getAutoOpen(), container);
+				onSendContainer(container);
+			}
+			for (ContainerIterator it = container->iterator(); it.hasNext(); it.advance()) {
+				if (Container* subContainer = (*it)->getContainer()) {
+					if (subContainer->getAutoOpen() >= 0) {
+						addContainer(subContainer->getAutoOpen(), subContainer);
+						onSendContainer(subContainer);
+					}
+				}
+			}
 		}
 	}
 }
@@ -1100,7 +1152,7 @@ void Player::onCreatureAppear(Creature* creature, bool isLogin)
 		}
 
 		// load mount speed bonus
-		/*uint16_t currentMountId = currentOutfit.lookMount;
+		uint16_t currentMountId = currentOutfit.lookMount;
 		if (currentMountId != 0) {
 			Mount* currentMount = g_game.mounts.getMountByClientID(currentMountId);
 			if (currentMount && hasMount(currentMount)) {
@@ -1113,7 +1165,6 @@ void Player::onCreatureAppear(Creature* creature, bool isLogin)
 
 		// mounted player moved to pz on login, update mount status
 		onChangeZone(getZone());
-		*/
 
 		if (g_config.getBoolean(ConfigManager::PLAYER_CONSOLE_LOGS)) {
 			std::cout << name << " has logged in." << std::endl;
@@ -1160,9 +1211,19 @@ void Player::onChangeZone(ZoneType_t zone)
 			setAttackedCreature(nullptr);
 			onAttackedCreatureDisappear(false);
 		}
+	if (!group->access && isMounted()) {
+			dismount();
+			g_game.internalCreatureChangeOutfit(this, defaultOutfit);
+			wasMounted = true;
+		}
+	}else {
+		if (wasMounted) {
+			toggleMount(true);
+			wasMounted = false;
+		}
     }
 
-    g_game.updateCreatureWalkthrough(this);
+    //g_game.updateCreatureWalkthrough(this);
 	sendIcons();
 }
 
@@ -2354,13 +2415,17 @@ ReturnValue Player::queryAdd(int32_t index, const Thing& thing, uint32_t count, 
 		case CONST_SLOT_RIGHT: {
 			if (slotPosition & SLOTP_RIGHT) {
 				if (!g_config.getBoolean(ConfigManager::CLASSIC_EQUIPMENT_SLOTS)) {
-					if (item->getWeaponType() != WEAPON_SHIELD) {
+					if (item->getWeaponType() != WEAPON_SHIELD && item->getWeaponType() != WEAPON_QUIVER) {
 						ret = RETURNVALUE_CANNOTBEDRESSED;
 					} else {
 						const Item* leftItem = inventory[CONST_SLOT_LEFT];
 						if (leftItem) {
 							if ((leftItem->getSlotPosition() | slotPosition) & SLOTP_TWO_HAND) {
-								ret = RETURNVALUE_BOTHHANDSNEEDTOBEFREE;
+								if (item->getWeaponType() == WEAPON_QUIVER && leftItem->getWeaponType() == WEAPON_DISTANCE) {
+									ret = RETURNVALUE_NOERROR;
+								} else {
+									ret = RETURNVALUE_BOTHHANDSNEEDTOBEFREE;
+								}
 							} else {
 								ret = RETURNVALUE_NOERROR;
 							}
@@ -2379,7 +2444,11 @@ ReturnValue Player::queryAdd(int32_t index, const Thing& thing, uint32_t count, 
 					WeaponType_t type = item->getWeaponType(), leftType = leftItem->getWeaponType();
 
 					if (leftItem->getSlotPosition() & SLOTP_TWO_HAND) {
-						ret = RETURNVALUE_DROPTWOHANDEDITEM;
+						if (item->getWeaponType() == WEAPON_QUIVER && leftItem->getWeaponType() == WEAPON_DISTANCE) {
+							ret = RETURNVALUE_NOERROR;
+						} else {
+							ret = RETURNVALUE_DROPTWOHANDEDITEM;
+						}
 					} else if (item == leftItem && count == item->getItemCount()) {
 						ret = RETURNVALUE_NOERROR;
 					} else if (leftType == WEAPON_SHIELD && type == WEAPON_SHIELD) {
@@ -2402,16 +2471,24 @@ ReturnValue Player::queryAdd(int32_t index, const Thing& thing, uint32_t count, 
 			if (slotPosition & SLOTP_LEFT) {
 				if (!g_config.getBoolean(ConfigManager::CLASSIC_EQUIPMENT_SLOTS)) {
 					WeaponType_t type = item->getWeaponType();
-					if (type == WEAPON_NONE || type == WEAPON_SHIELD) {
+					if (type == WEAPON_NONE || type == WEAPON_SHIELD || type == WEAPON_QUIVER) {
 						ret = RETURNVALUE_CANNOTBEDRESSED;
 					} else if (inventory[CONST_SLOT_RIGHT] && (slotPosition & SLOTP_TWO_HAND)) {
-						ret = RETURNVALUE_BOTHHANDSNEEDTOBEFREE;
+						if (type == WEAPON_DISTANCE && inventory[CONST_SLOT_RIGHT]->getWeaponType() == WEAPON_QUIVER) {
+							ret = RETURNVALUE_NOERROR;
+						} else {
+							ret = RETURNVALUE_BOTHHANDSNEEDTOBEFREE;
+						}
 					} else {
 						ret = RETURNVALUE_NOERROR;
 					}
 				} else if (slotPosition & SLOTP_TWO_HAND) {
 					if (inventory[CONST_SLOT_RIGHT] && inventory[CONST_SLOT_RIGHT] != item) {
-						ret = RETURNVALUE_BOTHHANDSNEEDTOBEFREE;
+						if (item->getWeaponType() == WEAPON_DISTANCE && inventory[CONST_SLOT_RIGHT]->getWeaponType() == WEAPON_QUIVER) {
+							ret = RETURNVALUE_NOERROR;
+						} else {
+							ret = RETURNVALUE_BOTHHANDSNEEDTOBEFREE;
+						}
 					} else {
 						ret = RETURNVALUE_NOERROR;
 					}
@@ -2984,6 +3061,7 @@ void Player::postAddNotification(Thing* thing, const Cylinder* oldParent, int32_
 		updateInventoryWeight();
 		updateItemsLight();
 		sendStats();
+		sendItems();
 	}
 
 	if (const Item* item = thing->getItem()) {
@@ -3038,6 +3116,7 @@ void Player::postRemoveNotification(Thing* thing, const Cylinder* newParent, int
 		updateInventoryWeight();
 		updateItemsLight();
 		sendStats();
+		sendItems();
 	}
 
 	if (const Item* item = thing->getItem()) {
@@ -3327,6 +3406,9 @@ void Player::updateItemsLight(bool internal /*=false*/)
 void Player::onAddCondition(ConditionType_t type)
 {
 	Creature::onAddCondition(type);
+	if (type == CONDITION_OUTFIT && isMounted()) {
+		dismount();
+	}
 	sendIcons();
 }
 
@@ -3420,67 +3502,57 @@ void Player::onAttackedCreature(Creature* target, bool addFightTicks /* = true *
 {
 	Creature::onAttackedCreature(target);
 
-    if (target->getZone() == ZONE_PVP) {
-        return;
-    }
+	if (target->getZone() == ZONE_PVP) {
+		return;
+	}
 
-    if (target == this) {
-        if (addFightTicks) {
-            addInFightTicks();
-        }
-        return;
-    }
+	if (target == this) {
+		if (addFightTicks) {
+			addInFightTicks();
+		}
+		return;
+	}
 
-    if (hasFlag(PlayerFlag_NotGainInFight)) {
-        return;
-    }
+	if (hasFlag(PlayerFlag_NotGainInFight)) {
+		return;
+	}
 
-    Player* targetPlayer = target->getPlayer();
-    if (targetPlayer && !isPartner(targetPlayer) && !isGuildMate(targetPlayer)) {
-        const uint32_t limit = g_config.getNumber(ConfigManager::SKULL_LEVEL_DIFF);
-        const uint32_t diff = std::abs((int32_t)getLevel() - (int32_t)targetPlayer->getLevel());
-        if (diff >= limit) {
-            targetPlayer->addInFightTicks();
-            if (addFightTicks) {
-                addInFightTicks();
-            }
-            return;
-        }
+	Player* targetPlayer = target->getPlayer();
+	if (targetPlayer && !isPartner(targetPlayer) && !isGuildMate(targetPlayer)) {
+		if (!pzLocked && g_game.getWorldType() == WORLD_TYPE_PVP_ENFORCED) {
+			pzLocked = true;
+			sendIcons();
+		}
 
-        if (!pzLocked && g_game.getWorldType() == WORLD_TYPE_PVP_ENFORCED) {
-            pzLocked = true;
-            sendIcons();
-        }
+		targetPlayer->addInFightTicks();
 
-        targetPlayer->addInFightTicks();
+		if (getSkull() == SKULL_NONE && getSkullClient(targetPlayer) == SKULL_YELLOW) {
+			addAttacked(targetPlayer);
+			targetPlayer->sendCreatureSkull(this);
+		} else {
+			if (!targetPlayer->hasAttacked(this) || !g_config.getBoolean(ConfigManager::PZLOCK_SKULL_ATTACKER)) {
+				if (!pzLocked && g_game.getWorldType() != WORLD_TYPE_PVP_ENFORCED) {
+					pzLocked = true;
+					sendIcons();
+				}
 
-        if (getSkull() == SKULL_NONE && getSkullClient(targetPlayer) == SKULL_YELLOW) {
-            addAttacked(targetPlayer);
-            targetPlayer->sendCreatureSkull(this);
-        } else {
-            if (!targetPlayer->hasAttacked(this) || !g_config.getBoolean(ConfigManager::PZLOCK_SKULL_ATTACKER)) {
-                if (!pzLocked && g_game.getWorldType() != WORLD_TYPE_PVP_ENFORCED) {
-                    pzLocked = true;
-                    sendIcons();
-                }
+				if (!Combat::isInPvpZone(this, targetPlayer) && !isInWar(targetPlayer)) {
+					addAttacked(targetPlayer);
+					if (targetPlayer->getSkull() == SKULL_NONE && getSkull() == SKULL_NONE) {
+						setSkull(SKULL_WHITE);
+					}
 
-                if (!Combat::isInPvpZone(this, targetPlayer) && !isInWar(targetPlayer)) {
-                    addAttacked(targetPlayer);
-                    if (targetPlayer->getSkull() == SKULL_NONE && getSkull() == SKULL_NONE) {
-                        setSkull(SKULL_WHITE);
-                    }
+					if (getSkull() == SKULL_NONE) {
+						targetPlayer->sendCreatureSkull(this);
+					}
+				}
+			}
+		}
+	}
 
-                    if (getSkull() == SKULL_NONE) {
-                        targetPlayer->sendCreatureSkull(this);
-                    }
-                }
-            }
-        }
-    }
-
-    if (addFightTicks) {
-        addInFightTicks();
-    }
+	if (addFightTicks) {
+		addInFightTicks();
+	}
 }
 
 void Player::onAttacked()
@@ -4091,7 +4163,7 @@ GuildEmblems_t Player::getGuildEmblem(const Player* player) const
 	return GUILDEMBLEM_NEUTRAL;
 }
 
-/*
+
 uint8_t Player::getCurrentMount() const
 {
 	int32_t value;
@@ -4252,7 +4324,7 @@ void Player::dismount()
 	defaultOutfit.lookMount = 0;
 }
 
-bool Player::addOfflineTrainingTries(skills_t skill, uint64_t tries)
+/*bool Player::addOfflineTrainingTries(skills_t skill, uint64_t tries)
 {
 	if (tries == 0 || skill == SKILL_LEVEL) {
 		return false;
@@ -4555,112 +4627,4 @@ void Player::updateRegeneration()
 		condition->setParam(CONDITION_PARAM_MANAGAIN, vocation->getManaGainAmount());
 		condition->setParam(CONDITION_PARAM_MANATICKS, vocation->getManaGainTicks() * 1000);
 	}
-}
-
-void Player::updateCastSpellsTime(int64_t time)
-{
-	lastCastSpellTime = time;
-
-	if (g_config.getBoolean(ConfigManager::POTIONS_BLOCK_INSTANT_SPELLS)) {
-		lastPotionsTime = lastCastSpellTime;
-	}
-
-	if (g_config.getBoolean(ConfigManager::OTHERS_BLOCK_SPELLS)) {
-		lastOthersTime = lastCastSpellTime;
-	}
-}
-
-bool Player::hasTimeToCastSpells()
-{
-	if (g_config.getBoolean(ConfigManager::DEFAULT_POTIONS_RUNES_SPELLS_BEHAVIOR)) {
-		return true;
-	}
-	return lastCastSpellTime <= OTSYS_TIME();
-}
-
-void Player::updateUsePotionsTime(int64_t time)
-{
-	if (g_config.getBoolean(ConfigManager::USE_POTIONS_AND_RUNES_AT_SAME_TIME)) {
-		lastPotionsTime = time;
-	}
-	else {
-		lastPotionsTime = lastRunesTime = time;
-	}
-
-	if (g_config.getBoolean(ConfigManager::POTIONS_BLOCK_INSTANT_SPELLS)) {
-		lastCastSpellTime = lastPotionsTime;
-	}
-
-	if (g_config.getBoolean(ConfigManager::OTHERS_BLOCK_POTIONS)) {
-		lastOthersTime = lastPotionsTime;
-	}
-}
-
-bool Player::hasTimeToUsePotions()
-{
-	if (g_config.getBoolean(ConfigManager::DEFAULT_POTIONS_RUNES_SPELLS_BEHAVIOR)) {
-		return true;
-	}
-	return lastPotionsTime <= OTSYS_TIME();
-}
-
-void Player::updateUseRunesTime(int64_t time)
-{
-	if (g_config.getBoolean(ConfigManager::USE_POTIONS_AND_RUNES_AT_SAME_TIME)) {
-		lastRunesTime = time;
-	}
-	else {
-		lastRunesTime = lastPotionsTime = time;
-	}
-
-	if (g_config.getBoolean(ConfigManager::OTHERS_BLOCK_RUNES)) {
-		lastOthersTime = lastRunesTime;
-	}
-}
-
-bool Player::hasTimeToUseRunes()
-{
-	if (g_config.getBoolean(ConfigManager::DEFAULT_POTIONS_RUNES_SPELLS_BEHAVIOR)) {
-		return true;
-	}
-	return lastRunesTime <= OTSYS_TIME();
-}
-
-void Player::updateOtherActionsTime(int64_t time)
-{
-	lastOthersTime = time;
-
-	if (g_config.getBoolean(ConfigManager::OTHERS_BLOCK_RUNES)) {
-		lastRunesTime = lastOthersTime;
-	}
-
-	if (g_config.getBoolean(ConfigManager::OTHERS_BLOCK_POTIONS)) {
-		lastPotionsTime = lastOthersTime;
-	}
-
-	if (g_config.getBoolean(ConfigManager::OTHERS_BLOCK_MOVECREATURE)) {
-		lastMoveCreaturesTime = lastOthersTime;
-	}
-}
-
-bool Player::hasTimeToOtherActions()
-{
-	if (g_config.getBoolean(ConfigManager::DEFAULT_POTIONS_RUNES_SPELLS_BEHAVIOR)) {
-		return true;
-	}
-	return lastOthersTime <= OTSYS_TIME();
-}
-
-void Player::updateMoveCreaturesTime(int64_t time)
-{
-	lastMoveCreaturesTime = time;
-
-	if (g_config.getBoolean(ConfigManager::OTHERS_BLOCK_MOVECREATURE)) {
-		lastOthersTime = lastMoveCreaturesTime;
-	}
-}
-
-bool Player::hasTimeToMoveCreatures()
-{
-	return lastMoveCreaturesTime <= OTSYS_TIME();
 }
